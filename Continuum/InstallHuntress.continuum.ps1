@@ -1,4 +1,4 @@
-# Copyright (c) 2020 Huntress Labs, Inc.
+# Copyright (c) 2022 Huntress Labs, Inc.
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -55,9 +55,15 @@ $DebugPreference = "SilentlyContinue"
 # Find poorly written code faster with the most stringent setting.
 Set-StrictMode -Version Latest
 
+# Check for old outdated Windows PowerShell (script works as low as 2.0, this is for logging/debugging)
+$oldOS = $false
+if ($PsVersionTable.PsVersion.Major -lt 3){
+    $oldOS = $true
+}
+
 # Do not modify the following variables.
 # These are used by the Huntress support team when troubleshooting.
-$ScriptVersion = "2020 April 3; revision 1"
+$ScriptVersion = "2022 July 29; revision 2"
 $ScriptType = "Continuum"
 
 # Check for an account key specified on the command line.
@@ -70,15 +76,25 @@ if ( ! [string]::IsNullOrEmpty($orgkey) ) {
     $OrganizationKey = $orgkey
 }
 
-# Variables used throughout the Huntress Deployment Script.
+# variables used throughout this script
 $X64 = 64
 $X86 = 32
-$InstallerName = "HuntressInstaller.exe"
-$InstallerPath = Join-Path $Env:TMP $InstallerName
-$DebugLog = Join-Path $Env:TMP HuntressInstaller.log
-$DownloadURL = "https://update.huntress.io/download/" + $AccountKey + "/" + $InstallerName
-$HuntressAgentServiceName = "HuntressAgent"
-$HuntressUpdaterServiceName = "HuntressUpdater"
+$InstallerName   = "HuntressInstaller.exe"
+$InstallerPath   = Join-Path $Env:TMP $InstallerName
+$DebugLog        = Join-Path $Env:TMP HuntressInstaller.log
+$DownloadURL     = "https://update.huntress.io/download/" + $AccountKey + "/" + $InstallerName
+$HuntressKeyPath = "HKLM:\SOFTWARE\Huntress Labs\Huntress"
+$HuntressRegKey  = "HKLM:\SOFTWARE\Huntress Labs"
+$timeout         = 30  # Seconds to wait (used for installing/uninstalling)
+
+# pick the appropriate file to download based on the OS version
+if ($oldOS -eq $true) {
+    # For Windows Vista, Server 2008 (PoSh 2)
+    $DownloadURL = "https://update.huntress.io/legacy_download/" + $AccountKey + "/" + $InstallerName
+} else {
+    # For Windows 7+, Server 2008 R2+ (PoSh 3+)
+    $DownloadURL = "https://update.huntress.io/download/" + $AccountKey + "/" + $InstallerName
+}
 
 $PowerShellArch = $X86
 # 8 byte pointer is 64bit
@@ -86,8 +102,11 @@ if ([IntPtr]::size -eq 8) {
    $PowerShellArch = $X64
 }
 
-$ScriptFailed = "Script Failed!"
-$SupportMessage = "Please send the error message to the Huntress Team for help at support@huntress.com"
+# strings used throughout this script
+$ScriptFailed               = "Script Failed!"
+$SupportMessage             = "Please send the error message to support@huntress.com"
+$HuntressAgentServiceName   = "HuntressAgent"
+$HuntressUpdaterServiceName = "HuntressUpdater"
 
 ##############################################################################
 ## Continuum specific functions
@@ -272,6 +291,21 @@ function Confirm-ServiceRunning ($service) {
     return $false
 }
 
+# Stop the Agent and Updater services
+function StopHuntressServices {
+    LogMessage "Stopping Huntress services..."
+    if (Confirm-ServiceExists($HuntressAgentServiceName)) {
+        Stop-Service -Name "$HuntressAgentServiceName"
+    } else {
+        LogMessage "$($HuntressAgentServiceName) not found, nothing to stop"
+    }
+    if (Confirm-ServiceExists($HuntressUpdaterServiceName)) {
+        Stop-Service -Name "$HuntressUpdaterServiceName"
+    } else {
+        LogMessage "$($HuntressUpdaterServiceName) not found, nothing to stop"
+    }
+}
+
 function Get-WindowsArchitecture {
     if ($env:ProgramW6432) {
         $WindowsArchitecture = $X64
@@ -325,18 +359,15 @@ function Get-Installer {
         }
     }
 
+    # Attempt to download the correct installer for the given OS, throw error if it fails
     $WebClient = New-Object System.Net.WebClient
-
     try {
         $WebClient.DownloadFile($DownloadURL, $InstallerPath)
     } catch {
         $msg = $_.Exception.Message
-        $err = (
-            "ERROR: Failed to download the Huntress Installer. Please try accessing $DownloadURL " +
-            "from a web browser on the host where the download failed. If the issue persists, please " +
-            "send the error message to the Huntress Team for help at support@huntress.com.")
+        $err = "ERROR: Failed to download the Huntress Installer. Try accessing $($DownloadURL) from the host where the download failed. Contact support@huntress.io if the problem persists"
         LogMessage $msg
-        LogMessage $err
+        LogMessage "$($err)  Please contact support@huntress.io if the problem persists"
         throw $ScriptFailed + " " + $err + " " + $msg
     }
 
@@ -480,12 +511,6 @@ function Test-Installation {
     LogMessage "Installation verified!"
 }
 
-function StopHuntressServices {
-    LogMessage "Stopping Huntress services..."
-    Stop-Service -Name "$HuntressAgentServiceName"
-    Stop-Service -Name "$HuntressUpdaterServiceName"
-}
-
 function PrepReregister {
     LogMessage "Preparing to re-register agent..."
     StopHuntressServices
@@ -494,51 +519,244 @@ function PrepReregister {
     Remove-Item -Path "$HuntressKeyPath" -Recurse -ErrorAction SilentlyContinue
 }
 
+# looks at the Huntress log to return true if the agent is orphaned, false if the agent is active AB
+function isOrphan {
+    # find the Huntress log file or state that it can't be found
+    if (Test-Path 'C:\Program Files\Huntress\HuntressAgent.log') {
+        $Path = 'C:\Program Files\Huntress\HuntressAgent.log'
+    } elseif (Test-Path 'C:\Program Files (x86)\Huntress\HuntressAgent.log') {
+        $Path = 'C:\Program Files (x86)\Huntress\HuntressAgent.log'
+    } else {
+        LogMessage "Unable to locate log file, thus unable to check if orphaned"
+        return $false
+    }
+
+    # if the log was found, look through the last 10 lines for the orphaned agent error code
+    if ($Path -match 'HuntressAgent.log') {
+        $linesFromLog = Get-Content $Path | Select -last 10
+        ForEach ($line in $linesFromLog)    { 
+            if ($line -like "*bad status code: 401*") {
+                return $true
+            }
+        } 
+    }
+    return $false
+}
+
+# Check if the script is being run with admin access AB
+function testAdministrator {  
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent();
+    (New-Object Security.Principal.WindowsPrincipal $user).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)  
+}
+
+# Ensure the disk has enough space for the install files + agent, then write results to the log AB
+function checkFreeDiskSpace {
+    # Using an older disk query to be backwards compatible with PoSh 2, catch WMI errors and check repository
+    try {
+        $freeSpace = (Get-WmiObject -query "Select * from Win32_LogicalDisk where DeviceID='c:'" | Select FreeSpace).FreeSpace
+    } catch {
+        LogMessage "WMI issues discovered (free space query), attempting to fix the repository"
+        winmgt -verifyrepository
+        $drives = get-psdrive
+        foreach ($drive in $drives) {
+            if ($drive.Name -eq "C") { 
+                $freeSpace = $drive.Free
+            }
+        }
+    }
+    $freeSpaceNice = $freeSpace.ToString('N0')
+    $estimatedSpaceNeeded = 45123456
+    if ($freeSpace -lt $estimatedSpaceNeeded) {
+        $err = "Low disk space detected, you may have troubles completing this install. Only $($freeSpaceNice) bytes remaining (need about $($estimatedSpaceNeeded.ToString('N0'))."
+        Write-Host $err -ForegroundColor white -BackgroundColor red
+        LogMessage $err
+    } else {
+        LogMessage "Free disk space: $($freeSpaceNice)"
+    }
+}
+
+# determine the path in which Huntress is installed AB
+function getAgentPath {
+    # Ensure we resolve the correct Huntress directory regardless of operating system or process architecture.
+    if (Get-WindowsArchitecture -eq $X64) {
+        return (Join-Path $Env:ProgramW6432 "Huntress")  
+    } else {
+        return (Join-Path $Env:ProgramFiles "Huntress")
+    }    
+}
+
+# attempt to run a process and log the results AB 
+function runProcess ($process, $flags, $name){
+    try {
+        Start-Process $process $flags | Wait-Process -Timeout $timeout -ErrorAction Stop
+        LogMessage "$($name) finished"
+    } catch {
+        Stop-Process $process -Force
+        $err = "ERROR: $($name) failed to complete in $timeout seconds."
+        Write-Host $err -ForegroundColor white -BackgroundColor red
+        LogMessage $err
+        exit 0
+    }
+}
+
+# grab the currently installed agent version AB
+function getAgentVersion {
+    $exeAgentPath = Join-Path (getAgentPath) "HuntressAgent.exe"
+    $agentVersion = (Get-Item $exeAgentPath).VersionInfo.FileVersion
+    LogMessage "Agent version $($agentVersion) found"
+    return $agentVersion
+}
+
+# ensure all the Huntress services are running AB
+function repairAgent {
+    Start-Service HuntressAgent
+    Start-Service HuntressUpdater
+}
+
+# Fully uninstall the agent AB 
+function uninstallHuntress {
+    $agentPath       = getAgentPath
+    $updaterPath     = Join-Path $agentPath "HuntressUpdater.exe"
+    $exeAgentPath    = Join-Path $agentPath "HuntressAgent.exe"
+    $uninstallerPath = Join-Path $agentPath "Uninstall.exe"
+
+    # attempt to use the built in uninstaller, if not found use the uninstallers built into the Agent and Updater
+    if (Test-Path $agentPath) {
+        Write-Host "Uninstalling, please wait :) "
+        # run uninstaller.exe, if not found run the Agent's built in uninstaller and the Updater's built in uninstaller
+        if (Test-Path $uninstallerPath) {
+            runProcess "$($uninstallerPath)" "/S" "Uninstall.exe" -wait
+            Start-Sleep 15
+        } elseif (Test-Path $exeAgentPath) {
+            runProcess "$($exeAgentPath)" "/S" "Huntress Agent uninstaller" -wait
+            Start-Sleep 15
+        } elseif (Test-Path $updaterPath) {
+            runProcess "$($updaterPath)" "/S" "Updater uninstaller" -wait
+            Start-Sleep 15 
+        } else {
+            LogMessage "Agent path found but no uninstallers found. Attempting to manually uninstall"
+        }
+    } else {
+        $err = "Note: unable to find Huntress install folder. Attempting to manually uninstall."
+        Write-Host $err -ForegroundColor white -BackgroundColor red
+        LogMessage $err
+    }
+
+    # look for the Huntress directory, if found then delete
+    if (Test-Path $agentPath) {
+        Remove-Item -LiteralPath $agentPath -Force -Recurse -ErrorAction SilentlyContinue
+        LogMessage "Manual cleanup of Huntress folder: success"
+    } else {
+        LogMessage "Manual cleanup of Huntress folder: folder not found"    
+    }
+
+    # look for the registry keys, if exist then delete
+    if (Test-Path $HuntressRegKey) {
+        Get-Item -path $HuntressRegKey | Remove-Item -recurse
+        LogMessage "Manually deleted Huntress registry keys"
+    } else {
+        LogMessage "No registry keys found, uninstallation complete"
+    }
+}
+
+
 function main () {
+    # gather info on the host for logging purposes
     LogMessage "Script type: '$ScriptType'"
     LogMessage "Script version: '$ScriptVersion'"
     LogMessage "Host name: '$env:computerName'"
-    $os = (get-WMiObject -computername $env:computername -Class win32_operatingSystem).caption.Trim()
+    try {
+        $os = (get-WMiObject -computername $env:computername -Class win32_operatingSystem).caption.Trim()
+    } catch {
+        LogMessage "WMI issues discovered (computer name query), attempting to fix the repository"
+        winmgt -verifyrepository
+        $os = (get-itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName).ProductName
+    }
     LogMessage "Host OS: '$os'"
     LogMessage "Host Architecture: '$(Get-WindowsArchitecture)'"
+    if ($oldOS) {
+        LogMessage "Warning! Older version of PowerShell detected"
+    }
+    checkFreeDiskSpace
     LogMessage "PowerShell Architecture: '$PowerShellArch'"
-    if ($reinstall) {
-        LogMessage "Re-install agent: '$reinstall'"
-    }
-    if ($reregister) {
-        LogMessage "Re-register agent: '$reregister'"
-    }
     LogMessage "Installer location: '$InstallerPath'"
     LogMessage "Installer log: '$DebugLog'"
+    LogMessage "Administrator access: $(testAdministrator)"
 
-    # Continuum specific
-    $OrganizationKey = Get-OrganizationKey
+    # if run with the uninstall flag, exit so we don't reinstall the agent after
+    if ($uninstall) {
+        LogMessage "Uninstalling Huntress agent"
+        uninstallHuntress
+        exit 0
+    }
 
-    # trim keys before use
+    # if the agent is orphaned, switch to the full uninstall/reinstall (reregister flag)
+    if ( !($reregister)) {
+        if (isOrphan) {
+            $err = 'Huntress Agent is orphaned, unable to use the provided flag. Switching to uninstall/reinstall (reregister flag)'
+            Write-Host $err -ForegroundColor white -BackgroundColor red
+            LogMessage "$err"
+            $reregister = $true
+        }
+    }
+
+    # if run with no flags and no account key, assume repair
+    if (!$repair -and !$reregister -and !$uninstall -and !$reinstall -and ($AccountKey -eq "__ACCOUNT_KEY__")) {
+        LogMessage "No flags or account key found! Defaulting to the -repair flag."
+        $repair = $true
+    }
+
+    # if run with the repair flag, check if installed (install if not), if ver < 0.13.16 apply the fix
+    if ($repair) {
+        if (Test-Path(getAgentPath)){
+            repairAgent
+            LogMessage "Repair complete!"
+            exit 0
+        } else {
+            LogMessage "Agent not found! Attempting to install"
+            $reregister = $true
+        }
+    }
+
+    # trim keys for blanks before use
     $AccountKey = $AccountKey.Trim()
     $OrganizationKey = $OrganizationKey.Trim()
 
+    # check that all the parameters that were passed are valid
     Test-Parameters
 
-    $masked = $AccountKey.Substring(0,10) + "XXXXXXXXXXXXXXXXXXXXXXX"
-    LogMessage "AccountKey: '$masked'"
-    LogMessage "OrganizationKey: '$OrganizationKey'"
+    # Hide most of the account key in the logs, keeping the front and tail end for troubleshooting 
+    if ($AccountKey -ne "__Account_Key__") {
+        $masked = $AccountKey.Substring(0,4) + "************************" + $AccountKey.SubString(28,4)
+        LogMessage "AccountKey: '$masked'"
+        LogMessage "OrganizationKey: '$OrganizationKey'"
+        LogMessage "Tags: $($Tags)"
+    }
 
+    # reregister > reinstall > uninstall > install (in decreasing order of impact)
+    # reregister = reinstall + delete registry keys
+    # reinstall  = install + stop Huntress service 
     if ($reregister) {
+        LogMessage "Re-register agent: '$reregister'"
+        if ( !(Confirm-ServiceExists($HuntressAgentServiceName))) {
+            LogMessage "Run with the -reregister flag but the service wasn't found. Attempting to install...."
+        }
         PrepReregister
     } elseif ($reinstall) {
-        LogMessage "Re-installing agent..."
+        LogMessage "Re-install agent: '$reinstall'"
         if ( !(Confirm-ServiceExists($HuntressAgentServiceName)) ) {
-            $err = "The Huntress Agent is NOT installed; nothing to re-install. Exiting."
+            $err = "Script was run w/ reinstall flag but there's nothing to reinstall. Attempting to clean remnants, then install the agent fresh."
             LogMessage "$err"
-            exit 1
+            uninstallHuntress
+            exit 0
         }
         StopHuntressServices
     } else {
         LogMessage "Checking for HuntressAgent service..."
         if ( Confirm-ServiceExists($HuntressAgentServiceName) ) {
-            $err = "The Huntress Agent is already installed. Exiting."
+            $err = "The Huntress Agent is already installed. Exiting with no changes. Suggest using -reregister or -reinstall flags"
             LogMessage "$err"
+            Write-Host 'Huntress Agent is already installed. Suggest using the -reregister or -reinstall flags' -ForegroundColor white -BackgroundColor red
             exit 0
         }
     }
