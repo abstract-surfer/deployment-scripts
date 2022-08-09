@@ -33,10 +33,10 @@ Updated: 28 July 2022</ScriptNotes>
 		<ScriptFolder>
 			<NewDataSet>
 				<Table>
-					<FolderID>266</FolderID>
+					<FolderID>191</FolderID>
 					<ParentID>0</ParentID>
-					<Name>Huntress Scripts</Name>
-					<GUID>f6016cba-5efc-4cd5-a502-e61da703275f</GUID>
+					<Name>Custom Scripts</Name>
+					<GUID>2913a92b-4d16-4166-969d-ae4a804426b3</GUID>
 				</Table>
 			</NewDataSet>
 		</ScriptFolder>
